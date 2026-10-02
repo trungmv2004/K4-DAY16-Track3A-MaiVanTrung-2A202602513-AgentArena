@@ -70,6 +70,8 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+
 from harness.middleware import Middleware
 
 
@@ -79,16 +81,56 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        claims = claims if isinstance(claims, list) else []
+        kept = []
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                continue
+            text = claim["text"]
+            if ctx.saw(text) and "\n" not in text and "\r" not in text:
+                kept.append(claim)
+                continue
+            split = self._split_claim(ctx, claim)
+            if split:
+                kept.extend(split)
+                report["abstain"] = True
+        report["claims"] = kept
+        report["citations"] = sorted({
+            c["doc_id"] for c in kept
+            if isinstance(c.get("doc_id"), str) and c["doc_id"]
+        })
+        if not kept:
+            report["abstain"] = True
+            report["answer"] = "Không đủ căn cứ trong tài liệu đã đọc để trả lời."
+        elif kept != claims:
+            prefix = (
+                "Các nguồn chưa thống nhất: " if report.get("abstain")
+                else "Theo tài liệu đã đọc: "
+            )
+            report["answer"] = prefix + " ".join(c["text"] for c in kept)
+        return report
+
+    @staticmethod
+    def _split_claim(ctx, claim):
+        """Keep only exact substrings backed by two distinct observed documents."""
+        if ctx.corpus is None:
+            return []
+        text = claim["text"]
+        observed = ctx.observed_text
+        docs = [d for d in ctx.corpus.docs if d.body and d.body in observed]
+        # Look ahead so adjacent joins (" và và ") share their space safely.
+        for join in re.finditer("(?= và )", text):
+            left, right = text[:join.start()], text[join.start() + len(" và "):]
+            if not ctx.saw(left) or not ctx.saw(right):
+                continue
+            left_docs = [d for d in docs if any(left in line for line in d.body.splitlines())]
+            right_docs = [d for d in docs if any(right in line for line in d.body.splitlines())]
+            for first in left_docs:
+                for second in right_docs:
+                    if first.doc_id != second.doc_id:
+                        return [
+                            {**claim, "text": left, "doc_id": first.doc_id},
+                            {**claim, "text": right, "doc_id": second.doc_id},
+                        ]
+        return []

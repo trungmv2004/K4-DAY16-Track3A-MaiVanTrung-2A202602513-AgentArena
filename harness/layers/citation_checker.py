@@ -59,7 +59,12 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import json
+
+from arena.model import is_degraded
+from arena.tools import ToolResult
 from harness.middleware import Middleware
+from harness.layers.query_focus import focus_query, source_kind
 
 
 class CitationChecker(Middleware):
@@ -67,17 +72,50 @@ class CitationChecker(Middleware):
 
     name = "citation_checker"
 
+    def wrap_tool_call(self, ctx, call, name, args):
+        preferred = None
+        if name == "search" and isinstance(args.get("query"), str):
+            preferred = source_kind(args["query"])
+            query = focus_query(args["query"])
+            if query != args["query"]:
+                args = {**args, "query": query}
+        result = call(name, args)
+        if preferred is None or not result.ok or is_degraded(result.content):
+            return result
+        # Clean search responses are JSON lists from the frozen tool API.
+        # Reorder existing hits only; retain their IDs, titles and snippets.
+        hits = json.loads(result.content)
+        if not isinstance(hits, list) or not all(isinstance(hit, dict) for hit in hits):
+            return result
+        ranked = sorted(hits, key=lambda hit: preferred not in str(hit.get("title", "")).casefold())
+        if ranked == hits:
+            return result
+        return ToolResult(result.ok, json.dumps(ranked, ensure_ascii=False), error=result.error)
+
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+        observed = ctx.observed_text
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text, doc_id = claim.get("text"), claim.get("doc_id")
+            if not isinstance(text, str) or not text or text not in observed:
+                continue
+            doc = ctx.corpus.get(doc_id) if isinstance(doc_id, str) else None
+            if doc is not None and doc.body in observed and any(
+                text in line for line in doc.body.splitlines()
+            ):
+                continue
+            for source in ctx.corpus.docs:
+                if source.body and source.body in observed and any(
+                    text in line for line in source.body.splitlines()
+                ):
+                    claim["doc_id"] = source.doc_id
+                    break
+        report["citations"] = sorted({
+            c["doc_id"] for c in claims if isinstance(c, dict)
+            and isinstance(c.get("doc_id"), str) and c["doc_id"]
+        })
+        return report
